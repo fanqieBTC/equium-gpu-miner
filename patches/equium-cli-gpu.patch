@@ -1,0 +1,955 @@
+diff --git a/clients/cli-miner/Cargo.toml b/clients/cli-miner/Cargo.toml
+index cd77693..6f0557a 100644
+--- a/clients/cli-miner/Cargo.toml
++++ b/clients/cli-miner/Cargo.toml
+@@ -20,8 +20,13 @@ solana-client = "2.1"
+ solana-program = { workspace = true }
+ clap = { version = "4", features = ["derive"] }
+ anyhow = "1"
++bs58 = "0.5"
+ log = "0.4"
+ env_logger = "0.11"
+ rand = { workspace = true }
+ hex = { workspace = true }
++serde = { workspace = true }
++serde_json = { workspace = true }
+ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
++num_cpus = "1"
++crossbeam-channel = "0.5"
+diff --git a/clients/cli-miner/src/main.rs b/clients/cli-miner/src/main.rs
+index d02a33a..27c4910 100644
+--- a/clients/cli-miner/src/main.rs
++++ b/clients/cli-miner/src/main.rs
+@@ -9,8 +9,13 @@
+ //!                --keypair ~/.config/solana/id.json \
+ //!                --max-blocks 100
+ 
+-use std::path::PathBuf;
++use std::fs;
++use std::io::{BufRead, BufReader, BufWriter, Write};
++use std::path::{Path, PathBuf};
++use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+ use std::str::FromStr;
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::Arc;
+ use std::time::{Duration, Instant};
+ 
+ use anchor_lang::prelude::AccountMeta;
+@@ -18,11 +23,13 @@ use anchor_lang::{AccountDeserialize, InstructionData, ToAccountMetas};
+ use anchor_spl::associated_token::get_associated_token_address_with_program_id;
+ use anyhow::{anyhow, Context, Result};
+ use clap::Parser;
++use crossbeam_channel::bounded;
+ use equihash_core::challenge::{build_input, solution_hash};
+-use equihash_core::solver::solve;
++use equihash_core::solver::{try_nonce, BaseState};
+ use equihash_core::target::hash_under_target;
+ use equium::state::{EquiumConfig, CONFIG_SEED, VAULT_SEED};
+ use rand::RngCore;
++use serde::Deserialize;
+ use solana_client::rpc_client::RpcClient;
+ use solana_sdk::commitment_config::CommitmentConfig;
+ use solana_sdk::compute_budget::ComputeBudgetInstruction;
+@@ -34,7 +41,7 @@ use solana_sdk::sysvar;
+ use solana_sdk::transaction::Transaction;
+ 
+ #[derive(Parser, Debug)]
+-#[command(version, about = "Equium reference CPU miner")]
++#[command(version, about = "Equium CLI miner")]
+ struct Args {
+     /// RPC endpoint URL. Defaults to the public mainnet endpoint, which
+     /// rate-limits aggressively under sustained load — use a Helius / Triton
+@@ -42,7 +49,9 @@ struct Args {
+     #[arg(long, default_value = "https://api.mainnet-beta.solana.com")]
+     rpc_url: String,
+ 
+-    /// Path to a keypair JSON for the miner wallet.
++    /// Path to a keypair file for the miner wallet.
++    ///
++    /// Supports Solana JSON byte arrays and single-line base58 secret keys.
+     #[arg(long)]
+     keypair: PathBuf,
+ 
+@@ -59,8 +68,151 @@ struct Args {
+     cu_limit: u32,
+ 
+     /// Cap on nonce attempts per round before giving up and re-fetching state.
+-    #[arg(long, default_value_t = 4096u64)]
++    /// Keep this low enough that the miner refreshes stale challenges quickly.
++    #[arg(long, default_value_t = 256u64)]
+     max_nonces_per_round: u64,
++
++    /// Solver workers. Defaults to CPU parallelism - 1, capped at 32.
++    #[arg(long, default_value_t = 0usize)]
++    threads: usize,
++
++    /// Solver engine. auto/cpu use CPU workers; gpu/cuda use the CUDA MVP when
++    /// available; metal currently falls back to the CPU worker pool.
++    #[arg(long, default_value = "auto")]
++    engine: String,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum SolverEngine {
++    Cpu,
++    Cuda,
++}
++
++/// A winning solution ready for on-chain submission.
++struct RaceWinner {
++    nonce: [u8; 32],
++    soln_indices: Vec<u8>,
++}
++
++#[derive(Deserialize)]
++struct CudaSolverResponse {
++    #[serde(rename = "type")]
++    kind: String,
++    nonce: Option<String>,
++    soln_indices: Option<String>,
++    attempts: u64,
++    message: Option<String>,
++}
++
++/// Persistent CUDA solver child process. Keeps CUDA context alive across
++/// rounds, communicating via stdin/stdout JSON lines.
++struct CudaDaemon {
++    child: Child,
++    stdin: BufWriter<ChildStdin>,
++    stdout: BufReader<ChildStdout>,
++}
++
++impl CudaDaemon {
++    fn spawn(path: &Path) -> Result<Self> {
++        let mut child = Command::new(path)
++            .arg("--daemon")
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .with_context(|| format!("spawn CUDA daemon {}", path.display()))?;
++
++        let stdin = BufWriter::new(
++            child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?,
++        );
++        let mut stdout = BufReader::new(
++            child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?,
++        );
++
++        // Wait for the "ready" handshake.
++        let mut line = String::new();
++        stdout
++            .read_line(&mut line)
++            .context("read CUDA daemon ready")?;
++        let resp: CudaSolverResponse =
++            serde_json::from_str(line.trim()).context("parse CUDA daemon ready")?;
++        if resp.kind != "ready" {
++            return Err(anyhow!(
++                "expected CUDA daemon ready, got: {}",
++                line.trim()
++            ));
++        }
++
++        Ok(Self {
++            child,
++            stdin,
++            stdout,
++        })
++    }
++
++    fn solve(
++        &mut self,
++        input: &[u8],
++        max_nonces: u64,
++        target: Option<&[u8; 32]>,
++    ) -> Result<(Option<RaceWinner>, u64)> {
++        let mut cmd = format!(
++            "{{\"cmd\":\"solve\",\"input\":\"0x{}\",\"max_nonces\":{}",
++            hex::encode(input),
++            max_nonces,
++        );
++        if let Some(t) = target {
++            cmd.push_str(&format!(",\"target\":\"0x{}\"", hex::encode(t)));
++        }
++        cmd.push_str("}\n");
++
++        self.stdin
++            .write_all(cmd.as_bytes())
++            .context("write to CUDA daemon")?;
++        self.stdin.flush().context("flush CUDA daemon stdin")?;
++
++        let mut line = String::new();
++        self.stdout
++            .read_line(&mut line)
++            .context("read from CUDA daemon")?;
++        let resp: CudaSolverResponse =
++            serde_json::from_str(line.trim())
++                .with_context(|| format!("parse CUDA daemon JSON: {}", line.trim()))?;
++
++        match resp.kind.as_str() {
++            "found" => {
++                let nonce_hex = resp
++                    .nonce
++                    .ok_or_else(|| anyhow!("solver response missing nonce"))?;
++                let soln_hex = resp
++                    .soln_indices
++                    .ok_or_else(|| anyhow!("solver response missing soln_indices"))?;
++                let nonce_vec = parse_hex_vec(&nonce_hex, 32, "nonce")?;
++                let soln_indices = parse_hex_vec(&soln_hex, 68, "soln_indices")?;
++                let mut nonce = [0u8; 32];
++                nonce.copy_from_slice(&nonce_vec);
++                Ok((
++                    Some(RaceWinner {
++                        nonce,
++                        soln_indices,
++                    }),
++                    resp.attempts,
++                ))
++            }
++            "not_found" => Ok((None, resp.attempts)),
++            "error" => Err(anyhow!(
++                "solver error: {}",
++                resp.message.unwrap_or_else(|| "unknown".into())
++            )),
++            other => Err(anyhow!("unknown solver response type: {}", other)),
++        }
++    }
++
++    fn shutdown(mut self) {
++        let _ = self.stdin.write_all(b"{\"cmd\":\"quit\"}\n");
++        let _ = self.stdin.flush();
++        let _ = self.child.wait();
++    }
+ }
+ 
+ // ANSI styling shortcuts. Colors are picked to look good against either a
+@@ -99,13 +251,14 @@ fn main() -> Result<()> {
+         .init();
+ 
+     let args = Args::parse();
++    let solver_engine = resolve_engine(&args.engine);
++    let worker_count = pick_worker_count(args.threads);
+ 
+     let program_id: Pubkey = match &args.program_id {
+         Some(s) => Pubkey::from_str(s).context("invalid --program-id")?,
+         None => equium::ID,
+     };
+-    let miner_kp = read_keypair_file(&args.keypair)
+-        .map_err(|e| anyhow!("read keypair {}: {}", args.keypair.display(), e))?;
++    let miner_kp = read_miner_keypair(&args.keypair)?;
+     let miner = miner_kp.pubkey();
+ 
+     let rpc = RpcClient::new_with_commitment(args.rpc_url.clone(), CommitmentConfig::confirmed());
+@@ -116,6 +269,21 @@ fn main() -> Result<()> {
+     let network_label = network_label_from_url(&args.rpc_url);
+ 
+     print_boot(&miner, &program_id, network_label);
++    match solver_engine {
++        SolverEngine::Cpu => println!(
++            "   {}solver pool{}  {}{} CPU worker{}{}",
++            C_DIM,
++            C_RESET,
++            C_BOLD,
++            worker_count,
++            if worker_count == 1 { "" } else { "s" },
++            C_RESET,
++        ),
++        SolverEngine::Cuda => println!(
++            "   {}solver{}      {}CUDA daemon + CPU verifier{}",
++            C_DIM, C_RESET, C_BOLD, C_RESET,
++        ),
++    }
+ 
+     let mut blocks_mined = 0u64;
+     let started_at = Instant::now();
+@@ -136,14 +304,17 @@ fn main() -> Result<()> {
+     let mut try_in_round: u32 = 0;
+     let mut total_nonces: u64 = 0;
+     let mut total_reward_base: u64 = 0;
+-    // Empty-round watchdog. If the chain doesn't move for ROUND_STALL_SECS
+-    // seconds, the round has stalled — fire `advance_empty_round`. Cooldown
+-    // prevents us from spamming tx fees if our call is racing other miners.
+-    const ROUND_STALL_SECS: u64 = 75;
+-    const ADVANCE_COOLDOWN_SECS: u64 = 30;
++    // Empty-round watchdog. If the chain doesn't move for round_stall_secs
++    // seconds, the round has stalled — fire `advance_empty_round`. Keep the
++    // default conservative; setting ROUND_STALL_SECS=0 disables this entirely.
++    let round_stall_secs = env_u64("ROUND_STALL_SECS", 300);
++    let advance_cooldown_secs = env_u64("ADVANCE_COOLDOWN_SECS", 120);
+     let mut last_height_change_at = Instant::now();
+     let mut last_advance_attempt_at: Option<Instant> = None;
+ 
++    // Persistent CUDA daemon — spawned on first use, kept alive.
++    let mut cuda_daemon: Option<CudaDaemon> = None;
++
+     loop {
+         let cfg = fetch_config(&rpc, &config_pda)
+             .with_context(|| format!("fetch config at {}", config_pda))?;
+@@ -164,16 +335,15 @@ fn main() -> Result<()> {
+             println!("{}{}{}", C_GRAY, RULE, C_RESET);
+         }
+ 
+-        // Empty-round watchdog: if the round has stalled, try to advance it
+-        // ourselves. The on-chain instruction requires ROUND_TIMEOUT_SLOTS
+-        // (≈60s) of slot-elapsed time; we wait a bit longer for safety, and
+-        // back off ADVANCE_COOLDOWN_SECS between attempts so racing miners
+-        // don't all spam fees.
++        // Empty-round watchdog
+         let stall_for = last_height_change_at.elapsed();
+         let cooled_down = last_advance_attempt_at
+-            .map(|t| t.elapsed() >= Duration::from_secs(ADVANCE_COOLDOWN_SECS))
++            .map(|t| t.elapsed() >= Duration::from_secs(advance_cooldown_secs))
+             .unwrap_or(true);
+-        if stall_for >= Duration::from_secs(ROUND_STALL_SECS) && cooled_down {
++        if round_stall_secs > 0
++            && stall_for >= Duration::from_secs(round_stall_secs)
++            && cooled_down
++        {
+             println!(
+                 "   {}round stalled {}s — calling advance_empty_round{}",
+                 C_GRAY,
+@@ -195,8 +365,6 @@ fn main() -> Result<()> {
+                     println!("     {}↳ {}{}", C_GRAY, reason, C_RESET);
+                 }
+             }
+-            // Next config fetch will pick up the new height (if our call
+-            // landed). Skip the solve this iteration.
+             continue;
+         }
+ 
+@@ -206,46 +374,114 @@ fn main() -> Result<()> {
+             &miner.to_bytes(),
+             cfg.block_height,
+         );
+-        let mut rng = rand::thread_rng();
+-        let mut counter = 0u64;
+-        let solution = solve(cfg.equihash_n, cfg.equihash_k, &input, || {
+-            counter += 1;
+-            if counter > args.max_nonces_per_round {
+-                return None;
+-            }
+-            let mut nonce = [0u8; 32];
+-            rng.fill_bytes(&mut nonce);
+-            Some(nonce)
+-        });
+-
+-        let solution = match solution {
+-            Ok(s) => s,
+-            Err(_) => {
+-                println!("   {}solver gave up; refreshing{}", C_GRAY, C_RESET);
+-                std::thread::sleep(Duration::from_millis(500));
+-                continue;
++
++        // Dispatch to the appropriate solver engine. Both paths return
++        // only under-target solutions (or None if budget exhausted).
++        let (winner, nonces_tried) = match solver_engine {
++            SolverEngine::Cpu => race_for_solution(
++                cfg.equihash_n,
++                cfg.equihash_k,
++                &input,
++                &cfg.current_target,
++                worker_count,
++                args.max_nonces_per_round,
++            ),
++            SolverEngine::Cuda => {
++                // Lazy-spawn the persistent CUDA daemon.
++                if cuda_daemon.is_none() {
++                    match cuda_solver_path() {
++                        Some(path) => match CudaDaemon::spawn(&path) {
++                            Ok(d) => {
++                                println!(
++                                    "   {}↳ CUDA daemon started{}",
++                                    C_SAGE, C_RESET
++                                );
++                                cuda_daemon = Some(d);
++                            }
++                            Err(e) => {
++                                eprintln!(
++                                    "   {}cuda daemon failed to start: {}{}",
++                                    C_GRAY, e, C_RESET
++                                );
++                                // Fallback: try old-style one-shot
++                            }
++                        },
++                        None => {
++                            eprintln!(
++                                "   {}equium-cuda-solver not found; falling back to CPU{}",
++                                C_GRAY, C_RESET
++                            );
++                        }
++                    }
++                }
++
++                if let Some(ref mut daemon) = cuda_daemon {
++                    match daemon.solve(
++                        &input,
++                        args.max_nonces_per_round,
++                        Some(&cfg.current_target),
++                    ) {
++                        Ok((winner, attempts)) => (winner, attempts),
++                        Err(e) => {
++                            eprintln!(
++                                "   {}cuda daemon error: {}; restarting…{}",
++                                C_GRAY, e, C_RESET
++                            );
++                            // Kill broken daemon, will re-spawn next iteration
++                            if let Some(d) = cuda_daemon.take() {
++                                d.shutdown();
++                            }
++                            // Fallback to one-shot for this round
++                            match solve_cuda_oneshot(&input, args.max_nonces_per_round) {
++                                Ok(r) => r,
++                                Err(_) => race_for_solution(
++                                    cfg.equihash_n,
++                                    cfg.equihash_k,
++                                    &input,
++                                    &cfg.current_target,
++                                    worker_count,
++                                    args.max_nonces_per_round,
++                                ),
++                            }
++                        }
++                    }
++                } else {
++                    // No daemon available, fallback to CPU
++                    race_for_solution(
++                        cfg.equihash_n,
++                        cfg.equihash_k,
++                        &input,
++                        &cfg.current_target,
++                        worker_count,
++                        args.max_nonces_per_round,
++                    )
++                }
+             }
+         };
++
+         let solve_ms = solve_started.elapsed().as_millis() as u64;
+         try_in_round += 1;
+-        total_nonces = total_nonces.saturating_add(counter);
+-
++        total_nonces = total_nonces.saturating_add(nonces_tried);
+         let session_secs = started_at.elapsed().as_secs_f64().max(0.001);
+         let hashrate = total_nonces as f64 / session_secs;
+ 
+-        // Off-chain target check — saves an RPC roundtrip for solutions
+-        // that the on-chain verifier would reject as AboveTarget.
++        let solution = match winner {
++            Some(w) => w,
++            None => {
++                println!(
++                    "     {}· try #{}{}   {}exhausted{}        {}{}ms{}   {}{}{}",
++                    C_GRAY, try_in_round, C_RESET,
++                    C_DIM, C_RESET,
++                    C_DIM, solve_ms, C_RESET,
++                    C_GOLD, fmt_hashrate(hashrate), C_RESET,
++                );
++                continue;
++            }
++        };
++
++        // Sanity: re-verify off-chain that the winning solution is under target.
+         let cand_hash = solution_hash(&solution.soln_indices, &input);
+-        if !hash_under_target(&cand_hash, &cfg.current_target) {
+-            println!(
+-                "     {}· try #{}{}   {}above target{}        {}{}ms{}   {}{}{}",
+-                C_GRAY, try_in_round, C_RESET,
+-                C_DIM, C_RESET,
+-                C_DIM, solve_ms, C_RESET,
+-                C_GOLD, fmt_hashrate(hashrate), C_RESET,
+-            );
+-            continue;
+-        }
++        debug_assert!(hash_under_target(&cand_hash, &cfg.current_target));
+ 
+         match submit_mine(
+             &rpc,
+@@ -307,6 +543,9 @@ fn main() -> Result<()> {
+                 elapsed / blocks_mined as f64,
+                 fmt_hashrate(hashrate),
+             );
++            if let Some(d) = cuda_daemon.take() {
++                d.shutdown();
++            }
+             return Ok(());
+         }
+     }
+@@ -326,6 +565,242 @@ fn print_boot(miner: &Pubkey, program: &Pubkey, network: &str) {
+     println!("{}{}{}", C_GRAY, RULE, C_RESET);
+ }
+ 
++fn read_miner_keypair(path: &Path) -> Result<Keypair> {
++    match read_keypair_file(path) {
++        Ok(keypair) => Ok(keypair),
++        Err(json_err) => {
++            let raw = fs::read_to_string(path)
++                .with_context(|| format!("read keypair {}", path.display()))?;
++            let trimmed = raw.trim();
++            if trimmed.is_empty() {
++                return Err(anyhow!("read keypair {}: file is empty", path.display()));
++            }
++
++            let bytes = bs58::decode(trimmed).into_vec().map_err(|base58_err| {
++                anyhow!(
++                    "read keypair {}: expected Solana JSON array or base58 secret key; JSON error: {}; base58 error: {}",
++                    path.display(),
++                    json_err,
++                    base58_err
++                )
++            })?;
++
++            Keypair::from_bytes(&bytes).map_err(|keypair_err| {
++                anyhow!(
++                    "read keypair {}: invalid base58 secret key: {}",
++                    path.display(),
++                    keypair_err
++                )
++            })
++        }
++    }
++}
++
++fn resolve_engine(engine: &str) -> SolverEngine {
++    match engine.to_ascii_lowercase().as_str() {
++        "auto" | "cpu" => SolverEngine::Cpu,
++        "gpu" | "cuda" => {
++            if cuda_solver_path().is_some() {
++                SolverEngine::Cuda
++            } else {
++                eprintln!(
++                    "warning: --engine {} requested but equium-cuda-solver was not found; falling back to CPU worker pool.",
++                    engine
++                );
++                SolverEngine::Cpu
++            }
++        }
++        "metal" => {
++            eprintln!(
++                "warning: Metal Equihash backend is not implemented yet; falling back to CPU worker pool."
++            );
++            SolverEngine::Cpu
++        }
++        other => {
++            eprintln!(
++                "warning: unknown --engine '{}'; use auto, cpu, gpu, cuda, or metal. falling back to CPU.",
++                other
++            );
++            SolverEngine::Cpu
++        }
++    }
++}
++
++fn cuda_solver_path() -> Option<PathBuf> {
++    if let Ok(path) = std::env::var("EQUIUM_CUDA_SOLVER") {
++        let p = PathBuf::from(path);
++        if p.is_file() {
++            return Some(p);
++        }
++    }
++
++    let candidates = [
++        PathBuf::from("clients/cuda-solver/equium-cuda-solver"),
++        PathBuf::from("./equium-cuda-solver"),
++        std::env::current_exe()
++            .ok()
++            .and_then(|p| p.parent().map(|dir| dir.join("equium-cuda-solver")))
++            .unwrap_or_else(|| PathBuf::from("target/release/equium-cuda-solver")),
++    ];
++
++    candidates.into_iter().find(|path| path.is_file())
++}
++
++fn parse_hex_vec(value: &str, expected: usize, label: &str) -> Result<Vec<u8>> {
++    let hex = value.strip_prefix("0x").unwrap_or(value);
++    if hex.len() != expected * 2 {
++        return Err(anyhow!(
++            "{} must be {} bytes, got {} hex chars",
++            label,
++            expected,
++            hex.len()
++        ));
++    }
++    Ok(hex::decode(hex).with_context(|| format!("decode {}", label))?)
++}
++
++fn env_u64(name: &str, default: u64) -> u64 {
++    std::env::var(name)
++        .ok()
++        .and_then(|v| v.parse::<u64>().ok())
++        .unwrap_or(default)
++}
++
++/// Legacy one-shot CUDA solver (forks a new process each time). Used only as
++/// fallback when the persistent daemon is unavailable.
++fn solve_cuda_oneshot(
++    input: &[u8; equihash_core::challenge::I_LEN],
++    max_attempts: u64,
++) -> Result<(Option<RaceWinner>, u64)> {
++    let solver = cuda_solver_path().ok_or_else(|| anyhow!("equium-cuda-solver not found"))?;
++    let output = Command::new(&solver)
++        .arg("--input")
++        .arg(format!("0x{}", hex::encode(input)))
++        .arg("--max-nonces")
++        .arg(max_attempts.to_string())
++        .output()
++        .with_context(|| format!("run {}", solver.display()))?;
++
++    let stdout = String::from_utf8_lossy(&output.stdout);
++    let stderr = String::from_utf8_lossy(&output.stderr);
++    if !output.status.success() {
++        return Err(anyhow!(
++            "solver exited with {}; stdout={} stderr={}",
++            output.status,
++            stdout.trim(),
++            stderr.trim()
++        ));
++    }
++
++    let line = stdout
++        .lines()
++        .rev()
++        .find(|line| !line.trim().is_empty())
++        .ok_or_else(|| anyhow!("solver produced no output"))?;
++    let response: CudaSolverResponse =
++        serde_json::from_str(line).with_context(|| format!("parse solver JSON: {}", line))?;
++
++    match response.kind.as_str() {
++        "found" => {
++            let nonce_hex = response
++                .nonce
++                .ok_or_else(|| anyhow!("solver response missing nonce"))?;
++            let soln_hex = response
++                .soln_indices
++                .ok_or_else(|| anyhow!("solver response missing soln_indices"))?;
++            let nonce_vec = parse_hex_vec(&nonce_hex, 32, "nonce")?;
++            let soln_indices = parse_hex_vec(&soln_hex, 68, "soln_indices")?;
++            let mut nonce = [0u8; 32];
++            nonce.copy_from_slice(&nonce_vec);
++            Ok((
++                Some(RaceWinner {
++                    nonce,
++                    soln_indices,
++                }),
++                response.attempts,
++            ))
++        }
++        "not_found" => Ok((None, response.attempts)),
++        "error" => Err(anyhow!(
++            "solver error: {}",
++            response.message.unwrap_or_else(|| "unknown".into())
++        )),
++        other => Err(anyhow!("unknown solver response type: {}", other)),
++    }
++}
++
++fn pick_worker_count(requested: usize) -> usize {
++    if requested > 0 {
++        return requested.clamp(1, 128);
++    }
++    num_cpus::get().max(1)
++}
++
++/// Spawn `threads` solver workers and race them to find a nonce whose
++/// Equihash solution falls under `target`. Each worker grinds up to
++/// `max_per_thread` nonces before giving up. Returns the winning solution
++/// plus the total number of nonces actually tried (across all threads)
++/// so the caller can update its hashrate counter.
++fn race_for_solution(
++    n: u32,
++    k: u32,
++    input: &[u8; equihash_core::challenge::I_LEN],
++    target: &[u8; 32],
++    threads: usize,
++    max_per_thread: u64,
++) -> (Option<RaceWinner>, u64) {
++    let base = match BaseState::new(n, k, input) {
++        Ok(b) => Arc::new(b),
++        Err(_) => return (None, 0),
++    };
++    let stop = Arc::new(AtomicBool::new(false));
++    let total_nonces = Arc::new(AtomicU64::new(0));
++    let (tx, rx) = bounded::<RaceWinner>(1);
++
++    let mut handles = Vec::with_capacity(threads);
++    for _ in 0..threads {
++        let base = base.clone();
++        let input = *input;
++        let target = *target;
++        let stop = stop.clone();
++        let total = total_nonces.clone();
++        let tx = tx.clone();
++        let max = max_per_thread;
++        handles.push(std::thread::spawn(move || {
++            let mut rng = rand::thread_rng();
++            let mut tried: u64 = 0;
++            while tried < max && !stop.load(Ordering::Relaxed) {
++                let mut nonce = [0u8; 32];
++                rng.fill_bytes(&mut nonce);
++                tried += 1;
++                if let Some(soln) = try_nonce(&base, &input, &nonce) {
++                    let h = solution_hash(&soln, &input);
++                    if hash_under_target(&h, &target) {
++                        let _ = tx.send(RaceWinner {
++                            nonce,
++                            soln_indices: soln,
++                        });
++                        stop.store(true, Ordering::Relaxed);
++                        break;
++                    }
++                }
++            }
++            total.fetch_add(tried, Ordering::Relaxed);
++        }));
++    }
++    drop(tx);
++
++    // Wait for either a winner or all threads to exhaust their budget.
++    let winner = rx.recv_timeout(Duration::from_secs(600)).ok();
++    stop.store(true, Ordering::Relaxed);
++    for h in handles {
++        let _ = h.join();
++    }
++
++    let nonces_tried = total_nonces.load(Ordering::Relaxed);
++    (winner, nonces_tried)
++}
++
+ fn network_label_from_url(url: &str) -> &'static str {
+     if url.contains("mainnet") {
+         "solana mainnet"
+@@ -404,6 +879,13 @@ fn derive_ata(owner: &Pubkey, mint: &Pubkey, token_program_id: &Pubkey) -> Pubke
+ 
+ fn fetch_config(rpc: &RpcClient, config_pda: &Pubkey) -> Result<EquiumConfig> {
+     let acct = rpc.get_account(config_pda)?;
++    if acct.data.is_empty() {
++        return Err(anyhow!(
++            "config PDA {} exists but has no data and is owned by {}; Equium mining may not be initialized/open on this network yet",
++            config_pda,
++            acct.owner
++        ));
++    }
+     let mut data = acct.data.as_slice();
+     let cfg = EquiumConfig::try_deserialize(&mut data)?;
+     Ok(cfg)
+diff --git a/crates/equihash-core/examples/verify_solution.rs b/crates/equihash-core/examples/verify_solution.rs
+new file mode 100644
+index 0000000..21f2d32
+--- /dev/null
++++ b/crates/equihash-core/examples/verify_solution.rs
+@@ -0,0 +1,61 @@
++//! Verify a supplied Equium Equihash solution.
++//!
++//! Usage:
++//!   cargo run -p equihash-core --features solver --example verify_solution -- \
++//!     --input-hex <81-byte-hex> \
++//!     --nonce-hex <32-byte-hex> \
++//!     --soln-hex <68-byte-hex>
++
++use std::env;
++
++use equihash_core::challenge::I_LEN;
++use equihash_core::verify;
++use equihash_core::{DEFAULT_K, DEFAULT_N};
++
++fn arg_value(args: &[String], key: &str) -> Option<String> {
++    args.windows(2).find(|pair| pair[0] == key).map(|pair| pair[1].clone())
++}
++
++fn decode_hex(value: &str, expected: usize, label: &str) -> Vec<u8> {
++    let hex = value.strip_prefix("0x").unwrap_or(value);
++    let bytes = hex::decode(hex).unwrap_or_else(|e| panic!("decode {label}: {e}"));
++    assert_eq!(
++        bytes.len(),
++        expected,
++        "{label} must be {expected} bytes, got {}",
++        bytes.len()
++    );
++    bytes
++}
++
++fn main() {
++    let args: Vec<String> = env::args().collect();
++    let input_hex = arg_value(&args, "--input-hex").expect("--input-hex is required");
++    let nonce_hex = arg_value(&args, "--nonce-hex").expect("--nonce-hex is required");
++    let soln_hex = arg_value(&args, "--soln-hex").expect("--soln-hex is required");
++    let target_hex = arg_value(&args, "--target-hex")
++        .unwrap_or_else(|| "ff".repeat(32));
++
++    let input_vec = decode_hex(&input_hex, I_LEN, "input");
++    let nonce_vec = decode_hex(&nonce_hex, 32, "nonce");
++    let soln_indices = decode_hex(&soln_hex, 68, "soln_indices");
++    let target_vec = decode_hex(&target_hex, 32, "target");
++
++    let mut input = [0u8; I_LEN];
++    input.copy_from_slice(&input_vec);
++    let mut nonce = [0u8; 32];
++    nonce.copy_from_slice(&nonce_vec);
++    let mut target = [0u8; 32];
++    target.copy_from_slice(&target_vec);
++
++    match verify::verify(DEFAULT_N, DEFAULT_K, &input, &nonce, &soln_indices, &target) {
++        Ok(hash) => println!(
++            "{{\"valid\":true,\"hash\":\"0x{}\"}}",
++            hex::encode(hash)
++        ),
++        Err(error) => {
++            println!("{{\"valid\":false,\"error\":\"{:?}\"}}", error);
++            std::process::exit(1);
++        }
++    }
++}
+diff --git a/crates/equihash-core/src/solver.rs b/crates/equihash-core/src/solver.rs
+index 0c16142..32eeb76 100644
+--- a/crates/equihash-core/src/solver.rs
++++ b/crates/equihash-core/src/solver.rs
+@@ -168,73 +168,96 @@ fn compress_indices(n: u32, k: u32, indices: &[u32]) -> Vec<u8> {
+     out
+ }
+ 
+-/// Solve Equihash for the given (n, k) and base input bytes.
+-///
+-/// Algorithm: generate `2^(cbits+1)` initial leaves; run `k` Wagner rounds
+-/// (each pairs on `cbits` and trims `cbytes` from the hash); after the
+-/// final round, scan remaining rows for one whose residual hash is all
+-/// zero — that's a candidate solution. Re-verify via `equihash::is_valid_solution`
+-/// before returning.
+-pub fn solve<F>(n: u32, k: u32, input: &[u8; I_LEN], mut next_nonce: F) -> Result<Solution, SolveError>
+-where
+-    F: FnMut() -> Option<[u8; 32]>,
+-{
+-    if n == 0 || k == 0 || n % 8 != 0 || n % (k + 1) != 0 || k >= n {
+-        return Err(SolveError::InvalidParams);
++/// Pre-built base BLAKE2b state for a given (n, k, input). Computed once
++/// per round and cloned per-nonce — the per-clone cost is much lower than
++/// re-running the personalization + input update each attempt.
++pub struct BaseState {
++    pub state: Blake2bState,
++    pub n: u32,
++    pub k: u32,
++}
++
++impl BaseState {
++    pub fn new(n: u32, k: u32, input: &[u8; I_LEN]) -> Result<Self, SolveError> {
++        if n == 0 || k == 0 || n % 8 != 0 || n % (k + 1) != 0 || k >= n {
++            return Err(SolveError::InvalidParams);
++        }
++        let hash_output = hash_output_len(n) as u8;
++        let mut state = init_state(n, k, hash_output);
++        state.update(input);
++        Ok(Self { state, n, k })
+     }
++}
+ 
++/// Try a single nonce against a pre-built `BaseState`. Returns the solution
++/// indices if this nonce yields a valid Equihash solution, `None` otherwise.
++///
++/// Cheaper for repeated calls than `solve()` because the base state is built
++/// once and reused. The unit of work is one Wagner search — the caller drives
++/// nonce selection and parallelism.
++pub fn try_nonce(base: &BaseState, input: &[u8; I_LEN], nonce: &[u8; 32]) -> Option<Vec<u8>> {
++    let n = base.n;
++    let k = base.k;
+     let cbits = cbits_of(n, k);
+     let cbytes = cbytes_of(n, k);
+-    let hash_output = hash_output_len(n) as u8;
+     let n_init: u32 = 1u32 << (cbits + 1);
+ 
+-    let mut base_state = init_state(n, k, hash_output);
+-    base_state.update(input);
++    let mut state_with_nonce = base.state.clone();
++    state_with_nonce.update(nonce);
+ 
+-    loop {
+-        let nonce = match next_nonce() {
+-            Some(nn) => nn,
+-            None => return Err(SolveError::NoSolutionFound),
+-        };
+-
+-        let mut state_with_nonce = base_state.clone();
+-        state_with_nonce.update(&nonce);
++    let mut rows: Vec<Row> = (0..n_init)
++        .map(|i| Row {
++            hash: generate_leaf_hash(&state_with_nonce, n, i),
++            indices: vec![i],
++        })
++        .collect();
+ 
+-        let mut rows: Vec<Row> = (0..n_init)
+-            .map(|i| Row {
+-                hash: generate_leaf_hash(&state_with_nonce, n, i),
+-                indices: vec![i],
+-            })
+-            .collect();
+-
+-        for _ in 0..k {
+-            rows = round(rows, cbits);
+-            if rows.is_empty() {
+-                break;
+-            }
++    for _ in 0..k {
++        rows = round(rows, cbits);
++        if rows.is_empty() {
++            return None;
+         }
++        let _ = cbytes; // already used inside `round`
++    }
+ 
+-        if rows.is_empty() {
++    let target_indices_len = 1usize << k;
++    for row in rows {
++        if row.indices.len() != target_indices_len {
+             continue;
+         }
++        if !row.hash.iter().all(|&b| b == 0) {
++            continue;
++        }
++        let compressed = compress_indices(n, k, &row.indices);
++        if equihash::is_valid_solution(n, k, input, nonce, &compressed).is_ok() {
++            return Some(compressed);
++        }
++    }
++    None
++}
+ 
+-        // After k rounds the residual hash is `cbits` bits. Candidates are
+-        // rows whose residual hash is all zero AND have exactly 2^k indices.
+-        let target_indices_len = 1usize << k;
+-        for row in rows {
+-            if row.indices.len() != target_indices_len {
+-                continue;
+-            }
+-            if !row.hash.iter().all(|&b| b == 0) {
+-                continue;
+-            }
+-            let compressed = compress_indices(n, k, &row.indices);
+-            if equihash::is_valid_solution(n, k, input, &nonce, &compressed).is_ok() {
+-                return Ok(Solution {
+-                    nonce,
+-                    soln_indices: compressed,
+-                });
+-            }
++/// Solve Equihash for the given (n, k) and base input bytes.
++///
++/// Sequential driver kept for backward compat with single-threaded callers
++/// (the WASM solver in the browser miner uses this). Multi-threaded callers
++/// should use `BaseState::new` + `try_nonce` and parallelize at the
++/// nonce-selection level.
++pub fn solve<F>(n: u32, k: u32, input: &[u8; I_LEN], mut next_nonce: F) -> Result<Solution, SolveError>
++where
++    F: FnMut() -> Option<[u8; 32]>,
++{
++    let base = BaseState::new(n, k, input)?;
++
++    loop {
++        let nonce = match next_nonce() {
++            Some(nn) => nn,
++            None => return Err(SolveError::NoSolutionFound),
++        };
++        if let Some(soln_indices) = try_nonce(&base, input, &nonce) {
++            return Ok(Solution {
++                nonce,
++                soln_indices,
++            });
+         }
+     }
+ }
